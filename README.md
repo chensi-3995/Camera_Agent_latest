@@ -1,6 +1,6 @@
-# Camera Agent 本地直连版
+# Camera Agent 
 
-本仓库只保留研究院内网直连版本，以及可视化大屏中的智能助理“小安”相关代码。
+研究院内网直连，以及可视化大屏中的智能助理“小安”相关代码。
 
 ## 功能范围
 
@@ -11,16 +11,11 @@
 - Flask Web 前端提供实时画面、关键帧分析、自然语言问答、全天日志总结。
 - 可视化大屏 `/dashboard` 集成智能助理“小安”，支持 ASR、问答、TTS 播报。
 
-## 不包含内容
-
-- 不包含远程录制网关版本。
-- 不包含摄像头真实密码、飞书密钥、数据库、视频、关键帧图片、模型权重、虚拟环境。
-- `camera_config.json` 中的地址和密钥均为占位符，部署前需要按本机环境修改。
 
 ## 启动顺序
 
 1. 修改 `camera_config.json` 中的 RTSP、Qwen2.5-VL、Ollama、Qdrant、飞书配置。
-2. 启动 Qdrant，例如 `docker run -p 6333:6333 -v D:\qdrant.data:/qdrant/storage qdrant/qdrant:v1.16`。
+2. 启动 Qdrant。
 3. 启动本地 Embedding 服务：`python api_server.py`。
 4. 启动本地问答模型服务，例如 Ollama：`ollama serve`。
 5. 如需语音大屏，启动 ASR 和 TTS 服务：
@@ -48,4 +43,3 @@
 - `raw_clips/`：录制视频片段。
 - `extracted_frames/`：关键帧图片。
 
-这些运行数据不会提交到 Git。
