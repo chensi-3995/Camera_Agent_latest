@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import atexit
-import base64
 import json
 import mimetypes
 import os
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -82,65 +80,6 @@ def _get_xiaoan_cached_audio_path(text: str) -> Path:
     if not audio_path.exists() or audio_path.stat().st_size <= 0:
         raise VoiceBridgeError("语音缓存文件不存在。")
     return audio_path
-
-
-def _quote_powershell_literal(value: str) -> str:
-    return str(value).replace("'", "''")
-
-
-def _speak_text_with_windows_sapi(text: str) -> None:
-    if os.name != "nt":
-        return
-    clean_text = str(text or "").strip()
-    if not clean_text:
-        return
-
-    local_speaker_dir = voice_bridge.outputs_dir / "local_speaker"
-    local_speaker_dir.mkdir(parents=True, exist_ok=True)
-    text_path = local_speaker_dir / f"xiaoan_speak_{int(time.time() * 1000)}.txt"
-    text_path.write_text(clean_text, encoding="utf-8")
-    quoted_text_path = _quote_powershell_literal(str(text_path))
-
-    script = f"""
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Speech
-$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$synth.Volume = 100
-$synth.Rate = 1
-$voice = $synth.GetInstalledVoices() |
-    Where-Object {{
-        $_.VoiceInfo.Culture.Name -like 'zh-*' -or
-        $_.VoiceInfo.Name -match 'Chinese|Huihui|Xiaoxiao|Xiaoyi|Yaoyao'
-    }} |
-    Select-Object -First 1
-if ($null -ne $voice) {{
-    $synth.SelectVoice($voice.VoiceInfo.Name)
-}}
-$text = [System.IO.File]::ReadAllText('{quoted_text_path}', [System.Text.Encoding]::UTF8)
-$synth.Speak($text)
-$synth.Dispose()
-"""
-    encoded_command = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-    try:
-        subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-EncodedCommand",
-                encoded_command,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=90,
-            check=False,
-        )
-    finally:
-        try:
-            text_path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def _build_stream_response(question: str, history: list[dict[str, str]], answer_callable, *, include_audio: bool = False) -> Response:
@@ -394,19 +333,6 @@ def xiaoan_voice_speak():
 @app.post("/api/xiaoan/voice/audio")
 def xiaoan_voice_audio():
     return voice_audio()
-
-
-@app.post("/api/xiaoan/voice/local_speak")
-def xiaoan_voice_local_speak():
-    payload = request.get_json(silent=True) or {}
-    text = str(payload.get("text", "")).strip()
-    if not text:
-        return jsonify({"message": "缺少要播报的文本内容。"}), 400
-    if os.name != "nt":
-        return jsonify({"message": "本机扬声器播报仅支持 Windows 本地运行。"}), 400
-
-    threading.Thread(target=_speak_text_with_windows_sapi, args=(text,), daemon=True).start()
-    return jsonify({"status": "started", "provider": "windows_sapi"})
 
 
 @app.get("/api/xiaoan/voice/cached/no-result")

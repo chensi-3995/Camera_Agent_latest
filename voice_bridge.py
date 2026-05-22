@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -14,8 +15,11 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_TTS_VOICE = "Lingyu"
-DEFAULT_TTS_SPEED = 1.2
+DEFAULT_TTS_PROVIDER = "sherpa_onnx"
+DEFAULT_TTS_PROVIDER_NAME = "sherpa_onnx_vits_zh_ll"
+DEFAULT_TTS_VOICE = "2"
+DEFAULT_TTS_SPEED = 1.18
+DEFAULT_TTS_CACHE_VERSION = "sherpa_onnx_vits_zh_ll_v1"
 
 
 class VoiceBridgeError(RuntimeError):
@@ -39,12 +43,12 @@ class VoicePipelineBridge:
         self.asr_host = "127.0.0.1"
         self.asr_port = 5092
 
-        self.moss_python = self.data_root / "venvs" / "moss-tts" / "Scripts" / "python.exe"
-        self.moss_fallback_python = self.project_root / ".venv" / "Scripts" / "python.exe"
-        self.moss_server_script = self.project_root / "tools" / "moss_tts_onnx_server.py"
-        self.moss_source_dir = self.data_root / "local_models" / "moss" / "MOSS-TTS-Nano"
-        self.moss_model_dir = self.moss_source_dir / "models"
-        self.moss_output_dir = self.outputs_dir / "moss"
+        self.tts_provider = DEFAULT_TTS_PROVIDER
+        self.sherpa_python = self.data_root / "venvs" / "sherpa-onnx-tts" / "Scripts" / "python.exe"
+        self.sherpa_fallback_python = self.project_root / ".venv" / "Scripts" / "python.exe"
+        self.sherpa_server_script = self.project_root / "tools" / "sherpa_onnx_tts_server.py"
+        self.sherpa_model_dir = self.data_root / "local_models" / "sherpa_onnx_tts" / "sherpa-onnx-vits-zh-ll"
+        self.sherpa_output_dir = self.outputs_dir / "sherpa_onnx"
         self.tts_host = "127.0.0.1"
         self.tts_port = 5091
 
@@ -78,10 +82,10 @@ class VoicePipelineBridge:
         return target_path
 
     def ensure_services_ready(self) -> None:
-        self.ensure_asr_server()
-        self.warmup_asr()
         self.ensure_tts_server()
         self.warmup_tts()
+        self.ensure_asr_server()
+        self.warmup_asr()
 
     def transcribe_file(self, audio_path: Path) -> dict[str, Any]:
         source_path = Path(audio_path).resolve()
@@ -97,7 +101,7 @@ class VoicePipelineBridge:
             path="/transcribe",
             payload={
                 "audio_path": str(source_path),
-                "language": "auto",
+                "language": "zh",
                 "batch_size_s": 30,
             },
             timeout_seconds=240,
@@ -112,7 +116,7 @@ class VoicePipelineBridge:
             raise VoiceBridgeError(message)
 
         transcript = str(response.get("text", "")).strip()
-        if not transcript:
+        if not self._is_valid_asr_transcript(transcript):
             raise VoiceBridgeError("No valid speech content was recognized.")
 
         return {
@@ -132,8 +136,15 @@ class VoicePipelineBridge:
         clean_text = str(text or "").strip()
         if not clean_text:
             raise VoiceBridgeError("Missing text content for speech synthesis.")
+        tts_text = self._normalize_tts_text_to_chinese(clean_text)
 
-        cache_key = self._build_tts_cache_key(clean_text, speed=speed, voice=voice)
+        cache_key = self._build_tts_cache_key(
+            tts_text,
+            speed=speed,
+            voice=voice,
+            provider=self.tts_provider,
+            cache_version=DEFAULT_TTS_CACHE_VERSION,
+        )
         payload_path = self.meta_dir / f"tts_{cache_key}.json"
         cache_meta_path = self.cache_dir / f"{cache_key}.json"
         preferred_audio_path = self.cache_dir / f"{cache_key}.wav"
@@ -151,7 +162,7 @@ class VoicePipelineBridge:
             port=self.tts_port,
             path="/synthesize",
             payload={
-                "text": clean_text,
+                "text": tts_text,
                 "output_path": str(preferred_audio_path),
                 "speed": float(speed),
                 "voice": str(voice or DEFAULT_TTS_VOICE).strip() or DEFAULT_TTS_VOICE,
@@ -174,6 +185,7 @@ class VoicePipelineBridge:
                 {
                     "output_path": str(output_path),
                     "text": clean_text,
+                    "tts_text": tts_text,
                     "speed": float(speed),
                     "voice": str(voice or DEFAULT_TTS_VOICE).strip() or DEFAULT_TTS_VOICE,
                 },
@@ -187,6 +199,7 @@ class VoicePipelineBridge:
             "audio_path": str(output_path),
             "audio_url": self._build_session_url(output_path),
             "text": clean_text,
+            "tts_text": tts_text,
             "cached": False,
         }
 
@@ -207,7 +220,7 @@ class VoicePipelineBridge:
                 path="/transcribe",
                 payload={
                     "audio_path": str(warmup_audio_path),
-                    "language": "auto",
+                    "language": "zh",
                     "batch_size_s": 30,
                 },
                 timeout_seconds=timeout_seconds,
@@ -347,7 +360,8 @@ class VoicePipelineBridge:
             )
         except VoiceBridgeError:
             return False
-        return bool(payload.get("ready")) and str(payload.get("provider", "")).strip() == "moss_tts_nano_onnx_cpu"
+        expected_provider = DEFAULT_TTS_PROVIDER_NAME
+        return bool(payload.get("ready")) and str(payload.get("provider", "")).strip() == expected_provider
 
     def _start_asr_server_process(self) -> None:
         if not self.sensevoice_python.exists():
@@ -385,13 +399,16 @@ class VoicePipelineBridge:
         )
 
     def _start_tts_server_process(self) -> None:
-        tts_python = self.moss_python if self.moss_python.exists() else self.moss_fallback_python
-        if not tts_python.exists():
-            raise VoiceBridgeError(f"Missing TTS Python environment: {self.moss_python}")
-        if not self.moss_server_script.exists():
-            raise VoiceBridgeError(f"Missing TTS server script: {self.moss_server_script}")
+        self._start_sherpa_onnx_tts_server_process()
 
-        log_path = self.logs_dir / f"moss_tts_onnx_server_{self._timestamp()}.log"
+    def _start_sherpa_onnx_tts_server_process(self) -> None:
+        tts_python = self.sherpa_python if self.sherpa_python.exists() else self.sherpa_fallback_python
+        if not tts_python.exists():
+            raise VoiceBridgeError(f"Missing sherpa-onnx TTS Python environment: {self.sherpa_python}")
+        if not self.sherpa_server_script.exists():
+            raise VoiceBridgeError(f"Missing sherpa-onnx TTS server script: {self.sherpa_server_script}")
+
+        log_path = self.logs_dir / f"sherpa_onnx_tts_server_{self._timestamp()}.log"
         if self._tts_server_log_handle is not None:
             self._tts_server_log_handle.close()
             self._tts_server_log_handle = None
@@ -401,23 +418,19 @@ class VoicePipelineBridge:
         self._tts_server_process = subprocess.Popen(
             [
                 str(tts_python),
-                str(self.moss_server_script),
+                str(self.sherpa_server_script),
                 "--host",
                 self.tts_host,
                 "--port",
                 str(self.tts_port),
-                "--source-dir",
-                str(self.moss_source_dir),
                 "--model-dir",
-                str(self.moss_model_dir),
+                str(self.sherpa_model_dir),
                 "--output-dir",
-                str(self.moss_output_dir),
+                str(self.sherpa_output_dir),
                 "--cpu-threads",
                 str(max(2, min(8, int(os.cpu_count() or 4)))),
-                "--voice",
-                DEFAULT_TTS_VOICE,
-                "--sample-mode",
-                "fixed",
+                "--speaker-id",
+                str(DEFAULT_TTS_VOICE),
             ],
             cwd=str(self.project_root),
             stdout=self._tts_server_log_handle,
@@ -496,23 +509,144 @@ class VoicePipelineBridge:
                     "audio_path": str(cached_output_path),
                     "audio_url": self._build_session_url(cached_output_path),
                     "text": clean_text,
+                    "tts_text": str(cached_payload.get("tts_text", "")).strip() or clean_text,
                     "cached": True,
                 }
         except Exception:
             return None
         return None
 
+    @staticmethod
+    def _is_valid_asr_transcript(text: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(text or "").strip())
+        if not normalized:
+            return False
+        invalid_values = {
+            ".",
+            "。",
+            "the",
+            "the.",
+            "The.",
+            "字幕",
+            "谢谢",
+        }
+        if normalized in invalid_values:
+            return False
+        if re.fullmatch(r"[\W_]+", normalized, flags=re.UNICODE):
+            return False
+        if normalized.count("�") >= max(1, len(normalized) // 2):
+            return False
+        return True
+
+    @classmethod
+    def _normalize_tts_text_to_chinese(cls, text: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "").strip())
+        if not normalized:
+            return normalized
+
+        normalized = normalized.replace(":", "点")
+        normalized = normalized.replace(",", "，")
+        normalized = normalized.replace(".", "。")
+        normalized = re.sub(
+            r"(\d{4})年(\d{1,2})月(\d{1,2})[日号]",
+            lambda m: f"{cls._digits_to_chinese(m.group(1))}年{cls._int_to_chinese(int(m.group(2)))}月{cls._int_to_chinese(int(m.group(3)))}日",
+            normalized,
+        )
+        normalized = re.sub(
+            r"(?<!\d)(\d{1,2})月(\d{1,2})[日号]",
+            lambda m: f"{cls._int_to_chinese(int(m.group(1)))}月{cls._int_to_chinese(int(m.group(2)))}日",
+            normalized,
+        )
+        normalized = re.sub(
+            r"(?<!\d)(\d{1,2})点(\d{2})(?!\d)",
+            lambda m: cls._format_chinese_time(int(m.group(1)), int(m.group(2))),
+            normalized,
+        )
+        normalized = re.sub(
+            r"(?<!\d)(\d+)(号摄像头|号|条|起|个|名|次|人|分|点)",
+            lambda m: f"{cls._int_to_chinese(int(m.group(1)))}{m.group(2)}",
+            normalized,
+        )
+        normalized = re.sub(
+            r"\d+",
+            lambda m: cls._int_to_chinese(int(m.group(0))) if len(m.group(0)) <= 4 else cls._digits_to_chinese(m.group(0)),
+            normalized,
+        )
+        return normalized
+
+    @staticmethod
+    def _digits_to_chinese(value: str) -> str:
+        digit_map = {
+            "0": "零",
+            "1": "一",
+            "2": "二",
+            "3": "三",
+            "4": "四",
+            "5": "五",
+            "6": "六",
+            "7": "七",
+            "8": "八",
+            "9": "九",
+        }
+        return "".join(digit_map.get(ch, ch) for ch in str(value))
+
+    @classmethod
+    def _format_chinese_time(cls, hour: int, minute: int) -> str:
+        hour_text = cls._int_to_chinese(hour)
+        if minute == 0:
+            return f"{hour_text}点整"
+        return f"{hour_text}点{cls._int_to_chinese(minute)}分"
+
+    @staticmethod
+    def _int_to_chinese(value: int) -> str:
+        value = int(value)
+        if value == 0:
+            return "零"
+        if value < 0:
+            return "负" + VoicePipelineBridge._int_to_chinese(abs(value))
+        if value >= 10000:
+            return VoicePipelineBridge._digits_to_chinese(str(value))
+
+        digits = "零一二三四五六七八九"
+        units = ["", "十", "百", "千"]
+        chars = list(str(value))
+        result: list[str] = []
+        zero_pending = False
+        length = len(chars)
+        for idx, ch in enumerate(chars):
+            digit = int(ch)
+            unit_index = length - idx - 1
+            if digit == 0:
+                zero_pending = bool(result)
+                continue
+            if zero_pending:
+                result.append("零")
+                zero_pending = False
+            if not (digit == 1 and unit_index == 1 and not result):
+                result.append(digits[digit])
+            result.append(units[unit_index])
+        return "".join(result)
+
     def _build_session_url(self, file_path: Path) -> str:
         relative_path = Path(file_path).resolve().relative_to(self.data_root).as_posix()
         return f"/session_data/{relative_path}"
 
     @staticmethod
-    def _build_tts_cache_key(text: str, *, speed: float, voice: str) -> str:
+    def _build_tts_cache_key(
+        text: str,
+        *,
+        speed: float,
+        voice: str,
+        provider: str = DEFAULT_TTS_PROVIDER,
+        cache_version: str = DEFAULT_TTS_CACHE_VERSION,
+    ) -> str:
         payload = json.dumps(
             {
                 "text": str(text or "").strip(),
                 "speed": round(float(speed), 3),
                 "voice": str(voice or "").strip(),
+                "provider": str(provider or "").strip(),
+                "cache_version": str(cache_version or "").strip(),
             },
             ensure_ascii=False,
             sort_keys=True,

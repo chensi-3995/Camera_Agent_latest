@@ -191,8 +191,50 @@ class MonitoringOrchestrator(
         if configured:
             return runtime
 
-        self.add_log("??", "????? app_id/app_secret/chat_id ? webhook_url????????????")
+        fallback = self._load_feishu_config_from_test_alert()
+        if fallback:
+            runtime.update(fallback)
+            self.config.feishu.app_id = runtime["app_id"]
+            self.config.feishu.app_secret = runtime["app_secret"]
+            self.config.feishu.chat_id = runtime["chat_id"]
+            self.config.feishu.webhook_url = runtime["webhook_url"]
+            self.add_log("飞书", "已从 test_alert.py 载入飞书配置。")
+        else:
+            self.add_log("飞书", "未找到可用的飞书配置，告警和日报推送将被跳过。")
         return runtime
+
+    def _load_feishu_config_from_test_alert(self) -> dict[str, str]:
+        candidate = self.config_path.parent / "test_alert.py"
+        if not candidate.exists():
+            return {}
+
+        content = ""
+        for encoding in ("utf-8", "gbk"):
+            try:
+                content = candidate.read_text(encoding=encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+            except OSError:
+                return {}
+
+        if not content:
+            return {}
+
+        def extract(name: str) -> str:
+            matched = re.search(rf"{name}\s*=\s*['\"]([^'\"]+)['\"]", content)
+            return matched.group(1).strip() if matched else ""
+
+        app_id = extract("FEISHU_APP_ID")
+        app_secret = extract("FEISHU_APP_SECRET")
+        chat_id = extract("FEISHU_CHAT_ID")
+        webhook_url = extract("FEISHU_WEBHOOK_URL")
+
+        if webhook_url:
+            return {"app_id": "", "app_secret": "", "chat_id": "", "webhook_url": webhook_url}
+        if app_id and app_secret and chat_id:
+            return {"app_id": app_id, "app_secret": app_secret, "chat_id": chat_id, "webhook_url": ""}
+        return {}
 
     def _init_vector_services(self) -> bool:
         if not self.embedding_client.enabled or not self.vector_store.enabled:

@@ -35,10 +35,12 @@ ANOMALY_META = {
 class MonitoringDashboardMixin:
     def get_dashboard_payload(self) -> dict[str, Any]:
         today = self._today()
+        yesterday = (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
         cameras = self.get_cameras_overview()
         task = self.get_task_status()
         logs = list(self.get_logs())
         today_events = list(self.get_events_for_date(today))
+        yesterday_events = list(self.get_events_for_date(yesterday))
 
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=6)
@@ -69,7 +71,7 @@ class MonitoringDashboardMixin:
                 "wake_ack": XIAOAN_WAKE_ACK_TEXT,
                 "placeholder": "例如：昨天有没有出现一个黑色衣服的人？",
             },
-            "overview": self._build_dashboard_overview(today_events, cameras, task),
+            "overview": self._build_dashboard_overview(today_events, yesterday_events, cameras, task),
             "trends": self._build_dashboard_trends(today_events, weekly_events),
             "structure": self._build_dashboard_structure(weekly_events or today_events),
             "cameras": cameras,
@@ -214,11 +216,14 @@ class MonitoringDashboardMixin:
     def _build_dashboard_overview(
         self,
         today_events: list[dict[str, Any]],
+        yesterday_events: list[dict[str, Any]],
         cameras: list[dict[str, Any]],
         task: dict[str, Any],
     ) -> dict[str, Any]:
         risk_counter = Counter(str(event.get("risk_level", "Low")) for event in today_events)
+        yesterday_risk_counter = Counter(str(event.get("risk_level", "Low")) for event in yesterday_events)
         alerts_sent = sum(1 for event in today_events if bool(event.get("alert_sent", False)))
+        yesterday_alerts_sent = sum(1 for event in yesterday_events if bool(event.get("alert_sent", False)))
         online_cameras = sum(1 for camera in cameras if bool(camera.get("available", False)))
         return {
             "today_event_count": len(today_events),
@@ -226,12 +231,49 @@ class MonitoringDashboardMixin:
             "medium_risk_count": risk_counter["Medium"],
             "low_risk_count": risk_counter["Low"],
             "alerts_sent_count": alerts_sent,
+            "yesterday_event_count": len(yesterday_events),
+            "yesterday_high_risk_count": yesterday_risk_counter["High"],
+            "yesterday_medium_risk_count": yesterday_risk_counter["Medium"],
+            "yesterday_low_risk_count": yesterday_risk_counter["Low"],
+            "yesterday_alerts_sent_count": yesterday_alerts_sent,
+            "today_event_delta": self._build_day_delta(len(today_events), len(yesterday_events)),
+            "high_risk_delta": self._build_day_delta(risk_counter["High"], yesterday_risk_counter["High"]),
+            "medium_risk_delta": self._build_day_delta(risk_counter["Medium"], yesterday_risk_counter["Medium"]),
+            "alerts_sent_delta": self._build_day_delta(alerts_sent, yesterday_alerts_sent),
             "online_cameras": online_cameras,
             "total_cameras": len(cameras),
             "task_status": str(task.get("status", "idle")),
             "task_label": self._task_status_label(str(task.get("status", "idle"))),
             "task_message": str(task.get("message", "")),
             "last_task_id": str(task.get("task_id", "")),
+        }
+
+    @staticmethod
+    def _build_day_delta(current: int, previous: int) -> dict[str, Any]:
+        current_count = int(current or 0)
+        previous_count = int(previous or 0)
+        diff = current_count - previous_count
+        if diff > 0:
+            direction = "up"
+        elif diff < 0:
+            direction = "down"
+        else:
+            direction = "flat"
+
+        if previous_count == 0:
+            percent = 0.0 if current_count == 0 else None
+            display = "0.0%" if current_count == 0 else "新增"
+        else:
+            percent = round(abs(diff) * 100 / previous_count, 1)
+            display = f"{percent:.1f}%"
+
+        return {
+            "current": current_count,
+            "previous": previous_count,
+            "diff": diff,
+            "percent": percent,
+            "display": display,
+            "direction": direction,
         }
 
     def _build_dashboard_trends(

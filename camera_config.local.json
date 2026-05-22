@@ -92,7 +92,7 @@
       "camera_id": "cam02",
       "name": "2号摄像头",
       "source_type": "rtsp",
-      "source": "rtsp://admin:Agent123@172.16.6.161:554/stream2",
+      "source": "rtsp://admin:Agent123@172.16.6.61:554/stream2",
       "fallback_file": "",
       "enabled": true,
       "preview_enabled": true,

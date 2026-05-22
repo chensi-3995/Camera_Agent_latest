@@ -499,7 +499,20 @@ class MonitoringAnalysisMixin:
             "倒在地上",
         )
 
-        if self._contains_any_keyword(normalized, fire_tokens):
+        def has_positive_keyword(keywords: tuple[str, ...], negations: tuple[str, ...]) -> bool:
+            for keyword in keywords:
+                start = normalized.find(keyword)
+                while start >= 0:
+                    window = normalized[max(0, start - 8): start + len(keyword) + 4]
+                    if not any(negation in window for negation in negations):
+                        return True
+                    start = normalized.find(keyword, start + len(keyword))
+            return False
+
+        fire_negations = ("无", "未", "没有", "未见", "未发现", "未出现", "无人持有")
+        fall_negations = ("无", "未", "没有", "未见", "未发现", "未出现", "无人倒地", "未倒地")
+
+        if has_positive_keyword(fire_tokens, fire_negations):
             overridden["anomaly_detected"] = True
             overridden["anomaly_type"] = "fire"
             overridden["risk_level"] = "High"
@@ -509,7 +522,7 @@ class MonitoringAnalysisMixin:
             if "打火机" not in reason and "火源" not in reason and "明火" not in reason:
                 overridden["reason"] = (reason + " " if reason else "") + "画面中出现打火机或明火迹象，按高风险事件处理。"
 
-        if self._contains_any_keyword(normalized, fall_tokens):
+        if has_positive_keyword(fall_tokens, fall_negations):
             overridden["anomaly_detected"] = True
             overridden["anomaly_type"] = "fall"
             overridden["risk_level"] = "High"

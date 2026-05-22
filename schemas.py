@@ -90,11 +90,11 @@ class CameraConfig:
 
 @dataclass
 class ServerConfig:
-    provider: str = "openai_compatible"
-    base_url: str = "http://YOUR_QWEN_VL_SERVER:8000/v1"
+    provider: str = "legacy_form"
+    base_url: str = "http://100.106.1.46:5120"
     photo_endpoint: str = "/photo"
     chat_endpoint: str = "/chat"
-    model: str = "qwen2_5_VL"
+    model: str = ""
     api_key: str = "$empty"
     chat_completions_endpoint: str = "/chat/completions"
     timeout_seconds: int = 120

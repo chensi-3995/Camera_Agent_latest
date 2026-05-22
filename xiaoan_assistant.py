@@ -133,6 +133,97 @@ class XiaoAnAssistantMixin:
         }
 
     @staticmethod
+    def _build_xiaoan_speech_text(answer: str) -> str:
+        text = re.sub(r"\s+", " ", str(answer or "").strip())
+        if not text:
+            return XIAOAN_NO_RESULT_TEXT
+        if text == XIAOAN_NO_RESULT_TEXT or "未发现相关异常记录" in text:
+            return XIAOAN_NO_RESULT_TEXT
+
+        short = XiaoAnAssistantMixin._try_build_short_speech_text(text)
+        if short:
+            return short
+
+        text = text.replace("相关记录", "记录")
+        text = text.replace("风险等级为", "")
+        text = text.replace("共发现", "发现")
+        text = text.replace("共检索到", "发现")
+        text = re.sub(r"(\d{1,2}):(\d{2})", r"\1点\2分", text)
+        text = XiaoAnAssistantMixin._compact_xiaoan_speech_fragment(text)
+        if len(text) > 42:
+            text = text[:42].rstrip("，。；;、 ") + "。"
+        return text
+
+    @staticmethod
+    def _try_build_short_speech_text(answer: str) -> str:
+        lead_match = re.search(r"(.+?日)发现(\d+)条(.+?)相关?记录", answer)
+        if not lead_match:
+            return ""
+
+        date_label = lead_match.group(1)
+        count = lead_match.group(2)
+        subject = XiaoAnAssistantMixin._build_speech_subject_label(lead_match.group(3))
+        risk_match = re.search(r"风险等级为(高风险|中风险|低风险)", answer)
+        risk_suffix = f"{risk_match.group(1)}" if risk_match else ""
+        if risk_suffix and risk_suffix in subject:
+            risk_suffix = ""
+
+        detail_match = re.search(r"最典型的是(\d{1,2}):(\d{2})，([^，。]+)", answer)
+        if detail_match:
+            detail = XiaoAnAssistantMixin._compact_xiaoan_speech_fragment(detail_match.group(3))
+            camera_match = re.search(r"([一二三四五六七八九十\d]+号摄像头)", detail)
+            camera = camera_match.group(1) if camera_match else ""
+            action = ""
+            if "打火机" in detail:
+                action = "有人持打火机"
+            elif "倒地" in detail or "跌倒" in detail:
+                action = "有人倒地"
+            elif subject not in {"白衣", "黑衣", "深色衣服"}:
+                action = detail.replace(camera, "")[:8]
+            suffix = risk_suffix or action
+            return f"{date_label}有{count}条{subject}记录，{camera}{suffix}。"
+
+        suffix = f"，{risk_suffix}" if risk_suffix else ""
+        return f"{date_label}有{count}条{subject}记录{suffix}。"
+
+    @staticmethod
+    def _build_speech_subject_label(text: str) -> str:
+        compact = XiaoAnAssistantMixin._compact_xiaoan_speech_fragment(text)
+        if "白衣" in compact:
+            return "白衣"
+        if "黑衣" in compact or "黑色" in compact:
+            return "黑衣"
+        if "深色" in compact:
+            return "深色衣服"
+        if "高风险" in compact:
+            return "高风险"
+        if "中风险" in compact:
+            return "中风险"
+        if "低风险" in compact:
+            return "低风险"
+        return compact[:8] or "相关"
+
+    @staticmethod
+    def _compact_xiaoan_speech_fragment(text: str) -> str:
+        compact = str(text or "").strip(" ，。；;、 ")
+        replacements = {
+            "白色衣着人员经过": "白衣人员经过",
+            "白色衣着人员": "白衣人员",
+            "白色衣服的人": "白衣人员",
+            "白色衣服人员": "白衣人员",
+            "高风险相关": "高风险",
+            "中风险相关": "中风险",
+            "低风险相关": "低风险",
+            "2号摄像头拍到人员持打火机": "2号摄像头有人持打火机",
+            "1号摄像头拍到人员持打火机": "1号摄像头有人持打火机",
+            "拍到人员持打火机": "有人持打火机",
+            "拍到": "",
+        }
+        for old, new in replacements.items():
+            compact = compact.replace(old, new)
+        return compact.strip(" ，。；;、 ")
+
+    @staticmethod
     def _is_xiaoan_greeting(question: str) -> bool:
         normalized = str(question or "").strip().lower()
         return normalized in {"你好", "您好", "嗨", "hello", "hi", "小安", "你好小安", "您好小安"}
@@ -300,6 +391,13 @@ class XiaoAnAssistantMixin:
         if "前天" in normalized:
             target = today - timedelta(days=2)
             return self._build_xiaoan_date_payload(target, target, "前天", explicit=True)
+        if any(token in normalized for token in ("最近几天", "近几天")):
+            start = today - timedelta(days=2)
+            return self._build_xiaoan_date_payload(start, today, "最近三天", explicit=True)
+
+        range_payload = self._parse_xiaoan_explicit_date_range(normalized, today=today)
+        if range_payload["explicit_date"]:
+            return range_payload
 
         weekday_match = re.search(r"上周([一二三四五六日天])", normalized)
         if weekday_match:
@@ -333,6 +431,53 @@ class XiaoAnAssistantMixin:
                 return self._build_xiaoan_date_payload(target, target, f"{month}月{day}日", explicit=True)
 
         return self._build_xiaoan_date_payload(None, None, "", explicit=False)
+
+    def _parse_xiaoan_explicit_date_range(self, normalized: str, today: date) -> dict[str, Any]:
+        connector = r"(?:到|至|—|-|~|～)"
+        number_token = r"[零〇一二两三四五六七八九十\d]{1,3}"
+
+        full_range = re.search(
+            rf"(?:(\d{{4}})[年/-])?({number_token})月({number_token})[日号]?"
+            rf"{connector}"
+            rf"(?:(\d{{4}})[年/-])?(?:({number_token})月)?({number_token})[日号]?",
+            normalized,
+        )
+        if full_range:
+            start_year = int(full_range.group(1) or today.year)
+            start_month = self._parse_xiaoan_number(full_range.group(2))
+            start_day = self._parse_xiaoan_number(full_range.group(3))
+            end_year = int(full_range.group(4) or start_year)
+            end_month = self._parse_xiaoan_number(full_range.group(5)) if full_range.group(5) else start_month
+            end_day = self._parse_xiaoan_number(full_range.group(6))
+            if start_month and start_day and end_month and end_day:
+                start = date(start_year, start_month, start_day)
+                end = date(end_year, end_month, end_day)
+                if end < start:
+                    start, end = end, start
+                label = self._format_xiaoan_date_range_label(start, end)
+                return self._build_xiaoan_date_payload(start, end, label, explicit=True)
+
+        numeric_range = re.search(
+            rf"(\d{{4}})[/-](\d{{1,2}})[/-](\d{{1,2}}){connector}(\d{{4}})[/-](\d{{1,2}})[/-](\d{{1,2}})",
+            normalized,
+        )
+        if numeric_range:
+            start = date(int(numeric_range.group(1)), int(numeric_range.group(2)), int(numeric_range.group(3)))
+            end = date(int(numeric_range.group(4)), int(numeric_range.group(5)), int(numeric_range.group(6)))
+            if end < start:
+                start, end = end, start
+            label = self._format_xiaoan_date_range_label(start, end)
+            return self._build_xiaoan_date_payload(start, end, label, explicit=True)
+
+        return self._build_xiaoan_date_payload(None, None, "", explicit=False)
+
+    @staticmethod
+    def _format_xiaoan_date_range_label(start: date, end: date) -> str:
+        if start == end:
+            return f"{start.month}月{start.day}日"
+        if start.year == end.year:
+            return f"{start.month}月{start.day}日到{end.month}月{end.day}日"
+        return f"{start.year}年{start.month}月{start.day}日到{end.year}年{end.month}月{end.day}日"
 
     @staticmethod
     def _build_xiaoan_date_payload(
@@ -514,7 +659,7 @@ class XiaoAnAssistantMixin:
     def _build_xiaoan_count_answer(self, query: dict[str, Any], events: list[dict[str, Any]]) -> str:
         count = len(events)
         label = self._build_xiaoan_subject_label(query)
-        lead = f"{query['date_label']}共发现{count}条{label}记录。"
+        lead = f"{query['date_label']}共发生{count}起{label}事件。"
         return self._build_xiaoan_brief_answer(lead, query, events)
 
     def _build_xiaoan_people_count_answer(self, query: dict[str, Any], events: list[dict[str, Any]]) -> str:

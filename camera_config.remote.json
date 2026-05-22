@@ -1,7 +1,7 @@
 {
   "server": {
     "provider": "openai_compatible",
-    "base_url": "http://172.16.20.13:8000/v1",
+    "base_url": "http://100.106.1.46:8000/v1",
     "photo_endpoint": "",
     "chat_endpoint": "",
     "model": "qwen2_5_VL",
@@ -65,12 +65,12 @@
     "webhook_url": ""
   },
   "capture": {
-    "mode": "local_direct",
-    "ssh_host": "",
+    "mode": "remote_manifest",
+    "ssh_host": "100.106.1.46",
     "ssh_port": 22,
-    "ssh_username": "",
+    "ssh_username": "jxq",
     "ssh_key_path": "",
-    "remote_manifest_path": "",
+    "remote_manifest_path": "/home/jxq/extraction-keyframe/video_get/data/manifests/clips.jsonl",
     "local_cache_dir": "D:\\camera_agent_data\\remote_clips",
     "processed_state_path": "D:\\camera_agent_data\\remote_processed_clips.json",
     "manifest_tail_lines": 500,
@@ -82,21 +82,21 @@
       "camera_id": "cam01",
       "name": "1号摄像头",
       "source_type": "rtsp",
-      "source": "rtsp://admin:Agent123@172.16.6.79:554/stream2",
+      "source": "",
       "fallback_file": "",
       "enabled": true,
-      "preview_enabled": true,
-      "description": "TP-Link Cam_01，研究院内网 RTSP 子码流。"
+      "preview_enabled": false,
+      "description": "远程录制模式下由服务器采集的 1 号摄像头。"
     },
     {
       "camera_id": "cam02",
       "name": "2号摄像头",
       "source_type": "rtsp",
-      "source": "rtsp://admin:Agent123@172.16.6.161:554/stream2",
+      "source": "",
       "fallback_file": "",
       "enabled": true,
-      "preview_enabled": true,
-      "description": "TP-Link Cam_02，研究院内网 RTSP 子码流。"
+      "preview_enabled": false,
+      "description": "远程录制模式下由服务器采集的 2 号摄像头。"
     }
   ]
 }

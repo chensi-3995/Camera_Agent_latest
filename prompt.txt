@@ -9,7 +9,7 @@
   "reason": "中文依据",
   "person_present": true,
   "person_count": 1,
-  "action_type": "经过/徘徊/停留/闯入/聚集/办公/未知",
+  "action_type": "经过/徘徊/停留/闯入/聚集/倒地/持火源/办公/未知",
   "upper_clothing_color": "黑色/白色/红色/蓝色/灰色/深色/浅色/未知",
   "lower_clothing_color": "黑色/白色/红色/蓝色/灰色/深色/浅色/未知",
   "confidence": 0.0
@@ -25,6 +25,16 @@
    - “1名人员正常经过门口，无明显异常”
 5. 如果无法准确判断衣着颜色或细节，可以使用“浅色上衣”“深色外套”“衣着细节不清”等保守表达，不能编造。
 6. 只有明显存在火情、打斗、闯入、跌倒、聚集、可疑徘徊等情况时，才将 anomaly_detected 设为 true。
+6.1. 如果画面中出现人员持打火机、明火、火源、点火动作，必须判定为高风险：
+   - anomaly_detected = true
+   - anomaly_type = "fire"
+   - risk_level = "High"
+   - action_type = "持火源"
+6.2. 如果画面中出现人员倒地、跌倒、摔倒、倒下、躺倒等情况，必须判定为高风险：
+   - anomaly_detected = true
+   - anomaly_type = "fall"
+   - risk_level = "High"
+   - action_type = "倒地"
 7. 普通人员路过、正常通行、正常巡逻、保洁经过等情况：
    - anomaly_detected = false
    - anomaly_type = "normal"
@@ -38,7 +48,7 @@
 13. confidence 使用 0 到 1 之间的小数，表示你对本次结构化判断的把握程度。
 
 风险分级参考：
-- High：火情、打斗、闯入、跌倒、明显破坏、强烈对抗、危险聚集
+- High：火情、持打火机或明火、打斗、闯入、跌倒、倒地、明显破坏、强烈对抗、危险聚集
 - Medium：可疑徘徊、长时间停留、可疑聚集、异常行为但危险性未明确
 - Low：正常通行、正常巡逻、普通经过、无明显异常
 

@@ -1,0 +1,22 @@
+{
+  "storage_dir": "/home/jxq/extraction-keyframe/video_get/data",
+  "manifest_path": "/home/jxq/extraction-keyframe/video_get/data/manifests/clips.jsonl",
+  "segment_seconds": 120,
+  "retention_days": 7,
+  "reconnect_backoff_seconds": 2.0,
+  "cleanup_interval_seconds": 3600,
+  "cameras": [
+    {
+      "camera_id": "cam01",
+      "name": "1号摄像头",
+      "rtsp_url": "rtsp://admin:Agent123@172.16.6.185:554/stream2",
+      "enabled": true
+    },
+    {
+      "camera_id": "cam02",
+      "name": "2号摄像头",
+      "rtsp_url": "rtsp://admin:Agent123@172.16.6.188:554/stream2",
+      "enabled": true
+    }
+  ]
+}

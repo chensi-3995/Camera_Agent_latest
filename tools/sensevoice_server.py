@@ -64,6 +64,7 @@ class SenseVoiceRuntime:
         self.model = AutoModel(
             model=str(self.model_dir),
             device=self.device,
+            trust_remote_code=True,
             disable_update=True,
         )
 

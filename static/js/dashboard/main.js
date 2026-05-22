@@ -11,12 +11,9 @@ import {
 const DASHBOARD_API = "/api/dashboard";
 const XIAOAN_STREAM_API = "/api/xiaoan/chat/stream";
 const XIAOAN_TRANSCRIBE_API = "/api/xiaoan/voice/transcribe";
-const XIAOAN_SPEAK_API = "/api/xiaoan/voice/speak";
 const XIAOAN_AUDIO_API = "/api/xiaoan/voice/audio";
-const XIAOAN_LOCAL_SPEAK_API = "/api/xiaoan/voice/local_speak";
 const XIAOAN_NO_RESULT_AUDIO_API = "/api/xiaoan/voice/cached/no-result";
 const XIAOAN_NO_RESULT_TEXT = "未发现相关异常记录。";
-const FALLBACK_LOGO = "/static/img/xiaoan-logo.png";
 const SILENT_AUDIO_DATA_URL = "data:audio/wav;base64,UklGRlYAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YTIAAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgA==";
 const SPEECH_RECOGNITION_CTOR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 const WAKE_NAME_VARIANTS = ["小安", "晓安", "小案", "小岸", "小按", "小暗", "小嗯"];
@@ -99,6 +96,75 @@ function pickSupportedMimeType() {
     return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || "";
 }
 
+function mergeFloat32Chunks(chunks) {
+    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const merged = new Float32Array(totalLength);
+    let offset = 0;
+    chunks.forEach((chunk) => {
+        merged.set(chunk, offset);
+        offset += chunk.length;
+    });
+    return merged;
+}
+
+function downsampleFloat32Buffer(buffer, sourceRate, targetRate = 16000) {
+    if (!buffer.length || sourceRate === targetRate) {
+        return buffer;
+    }
+    const ratio = sourceRate / targetRate;
+    const outputLength = Math.max(1, Math.round(buffer.length / ratio));
+    const output = new Float32Array(outputLength);
+    for (let index = 0; index < outputLength; index += 1) {
+        const start = Math.floor(index * ratio);
+        const end = Math.min(Math.floor((index + 1) * ratio), buffer.length);
+        let sum = 0;
+        let count = 0;
+        for (let sourceIndex = start; sourceIndex < end; sourceIndex += 1) {
+            sum += buffer[sourceIndex];
+            count += 1;
+        }
+        output[index] = count > 0 ? sum / count : 0;
+    }
+    return output;
+}
+
+function createWavBlobFromPcmChunks(chunks, sourceRate) {
+    const targetRate = 16000;
+    const samples = downsampleFloat32Buffer(mergeFloat32Chunks(chunks), sourceRate, targetRate);
+    const dataLength = samples.length * 2;
+    const buffer = new ArrayBuffer(44 + dataLength);
+    const view = new DataView(buffer);
+
+    const writeString = (offset, text) => {
+        for (let index = 0; index < text.length; index += 1) {
+            view.setUint8(offset + index, text.charCodeAt(index));
+        }
+    };
+
+    writeString(0, "RIFF");
+    view.setUint32(4, 36 + dataLength, true);
+    writeString(8, "WAVE");
+    writeString(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, targetRate, true);
+    view.setUint32(28, targetRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeString(36, "data");
+    view.setUint32(40, dataLength, true);
+
+    let offset = 44;
+    for (let index = 0; index < samples.length; index += 1) {
+        const sample = Math.max(-1, Math.min(1, samples[index]));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+        offset += 2;
+    }
+
+    return new Blob([buffer], { type: "audio/wav" });
+}
+
 function parseWakeTranscript(transcript, wakePhrase) {
     const rawText = String(transcript || "").trim();
     const normalizedTranscript = normalizeText(rawText).toLowerCase();
@@ -146,16 +212,17 @@ function parseWakeTranscript(transcript, wakePhrase) {
 
 function buildSvgTrend(values, width = 480, height = 140) {
     const safeValues = Array.isArray(values) && values.length ? values : new Array(24).fill(0);
-    const maxValue = Math.max(...safeValues, 1);
-    const left = 14;
+    const maxValue = 40;
+    const axisTicks = [0, 10, 20, 30, 40];
+    const left = 42;
     const right = width - 14;
     const top = 18;
-    const bottom = height - 18;
+    const bottom = height - 24;
     const stepX = safeValues.length > 1 ? (right - left) / (safeValues.length - 1) : 0;
 
     const points = safeValues.map((value, index) => {
         const x = left + index * stepX;
-        const ratio = value / maxValue;
+        const ratio = Math.max(0, Math.min(Number(value || 0), maxValue)) / maxValue;
         const y = bottom - (bottom - top) * ratio;
         return { x, y };
     });
@@ -165,12 +232,73 @@ function buildSvgTrend(values, width = 480, height = 140) {
         .join(" ");
     const areaPath = `${linePath} L ${right.toFixed(2)} ${bottom.toFixed(2)} L ${left.toFixed(2)} ${bottom.toFixed(2)} Z`;
 
-    const gridLines = [0.25, 0.5, 0.75].map((ratio) => {
+    const gridLines = axisTicks.map((value) => {
+        const ratio = value / maxValue;
         const y = bottom - (bottom - top) * ratio;
-        return { y: y.toFixed(2) };
+        return {
+            value,
+            label: String(value),
+            y: y.toFixed(2),
+        };
     });
 
-    return { linePath, areaPath, gridLines };
+    const xAxisTicks = [
+        { label: "00:00", x: left },
+        { label: "04:00", x: left + (right - left) * (4 / 24) },
+        { label: "08:00", x: left + (right - left) * (8 / 24) },
+        { label: "12:00", x: left + (right - left) * (12 / 24) },
+        { label: "16:00", x: left + (right - left) * (16 / 24) },
+        { label: "20:00", x: left + (right - left) * (20 / 24) },
+        { label: "24:00", x: right },
+    ].map((tick) => ({ ...tick, x: tick.x.toFixed(2) }));
+
+    return { linePath, areaPath, gridLines, xAxisTicks };
+}
+
+function buildWeeklyRiskBars(items, width = 320, height = 170) {
+    const safeItems = Array.isArray(items) ? items.slice(0, 7) : [];
+    const axisTicks = [0, 15, 30, 45, 60];
+    const maxValue = 60;
+    const left = 36;
+    const right = width - 14;
+    const top = 24;
+    const bottom = height - 28;
+    const plotWidth = right - left;
+    const slotWidth = safeItems.length ? plotWidth / safeItems.length : plotWidth;
+    const barWidth = Math.min(11, slotWidth * 0.22);
+    const barGap = Math.min(5, slotWidth * 0.1);
+    const gridLines = axisTicks.map((value) => {
+        const y = bottom - ((value / maxValue) * (bottom - top));
+        return { value, label: String(value), y: y.toFixed(2) };
+    });
+    const bars = safeItems.map((item, index) => {
+        const lowRawValue = Number(item.low || 0);
+        const highRawValue = Number(item.high || 0);
+        const groupWidth = barWidth * 2 + barGap;
+        const groupLeft = left + index * slotWidth + (slotWidth - groupWidth) / 2;
+        const buildBar = (rawValue, x, type) => {
+            const value = Math.max(0, Math.min(rawValue, maxValue));
+            const barHeight = Math.max(rawValue > 0 ? 4 : 0, (value / maxValue) * (bottom - top));
+            const y = bottom - barHeight;
+            return {
+                type,
+                value: rawValue,
+                x: x.toFixed(2),
+                y: y.toFixed(2),
+                width: barWidth.toFixed(2),
+                height: barHeight.toFixed(2),
+                centerX: (x + barWidth / 2).toFixed(2),
+            };
+        };
+        return {
+            date: item.date,
+            label: item.label,
+            low: buildBar(lowRawValue, groupLeft, "low"),
+            high: buildBar(highRawValue, groupLeft + barWidth + barGap, "high"),
+            labelX: (groupLeft + groupWidth / 2).toFixed(2),
+        };
+    });
+    return { bars, gridLines, left, right, top, bottom };
 }
 
 function riskPillClass(level) {
@@ -282,12 +410,14 @@ createApp({
             lastVoiceAt: 0,
             recordStartedAt: 0,
             voiceDetected: false,
+            pcmRecordingActive: false,
+            recordRequireWake: true,
             followupArmed: false,
             autoResumeAfterSpeak: false,
             audioUnlocked: false,
             preferBrowserAsr: false,
             browserAsrSupported: Boolean(SPEECH_RECOGNITION_CTOR),
-            preferBrowserTts: typeof window !== "undefined" && "speechSynthesis" in window,
+            preferBrowserTts: false,
             ttsRequestSeq: 0,
             noResultAudioUrl: XIAOAN_NO_RESULT_AUDIO_API,
         });
@@ -304,6 +434,27 @@ createApp({
         });
         const weeklyTrend = computed(() => dashboard.value?.trends?.weekly || []);
         const weeklyMax = computed(() => Math.max(...weeklyTrend.value.map((item) => Number(item.total || 0)), 1));
+        const weeklyHighMax = computed(() => Math.max(...weeklyTrend.value.map((item) => Number(item.high || 0)), 1));
+        const weeklyHighBarsSvg = computed(() => buildWeeklyRiskBars(weeklyTrend.value));
+        const onlineCameraRate = computed(() => {
+            const overview = dashboard.value?.overview || {};
+            const total = Number(overview.total_cameras || 0);
+            if (!total) {
+                return 0;
+            }
+            return Math.round((Number(overview.online_cameras || 0) / total) * 100);
+        });
+        function overviewDelta(metricKey) {
+            const overview = dashboard.value?.overview || {};
+            const delta = overview[`${metricKey}_delta`] || {};
+            const direction = String(delta.direction || "flat");
+            const display = String(delta.display || "0.0%");
+            const arrow = direction === "up" ? "▲" : direction === "down" ? "▼" : "◆";
+            return {
+                text: `${arrow} ${display}`,
+                className: `overview-delta-value--${direction}`,
+            };
+        }
         const donutStyle = computed(() => {
             const slices = structure.value?.risk_distribution || [];
             if (!slices.length) {
@@ -360,6 +511,22 @@ createApp({
                 window.cancelAnimationFrame(assistant.analyserFrameId);
                 assistant.analyserFrameId = 0;
             }
+            if (pcmCaptureState?.processor) {
+                try {
+                    pcmCaptureState.processor.onaudioprocess = null;
+                    pcmCaptureState.processor.disconnect();
+                } catch (error) {
+                    void error;
+                }
+            }
+            if (pcmCaptureState?.silenceGain) {
+                try {
+                    pcmCaptureState.silenceGain.disconnect();
+                } catch (error) {
+                    void error;
+                }
+            }
+            pcmCaptureState = null;
             if (assistant.analyserSource) {
                 try {
                     assistant.analyserSource.disconnect();
@@ -382,20 +549,26 @@ createApp({
             }
             assistant.recorder = null;
             assistant.recordChunks = [];
+            assistant.pcmRecordingActive = false;
+            assistant.recordRequireWake = true;
             assistant.recording = false;
         }
 
         function stopRecorderSafely() {
-            if (!assistant.recorder || assistant.recorder.state === "inactive") {
+            if (assistant.recorder && assistant.recorder.state !== "inactive") {
+                assistant.recorder.stop();
                 return;
             }
-            assistant.recorder.stop();
+            if (assistant.pcmRecordingActive) {
+                void stopPcmRecordingSession();
+            }
         }
 
         let activeAudioPlayer = null;
         let speechPlaybackContext = null;
         let activeBufferSource = null;
         let activeGainNode = null;
+        let pcmCaptureState = null;
 
         function stopActiveAudioPlayback() {
             if (activeBufferSource) {
@@ -793,6 +966,73 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
             return await playAudio(transientAudioUrl.value, soft, { cacheBust: false });
         }
 
+        async function playAudioBlobUntilEnded(blob, soft = false) {
+            if (!(blob instanceof Blob) || blob.size <= 0) {
+                return false;
+            }
+            releaseTransientAudioUrl();
+            transientAudioUrl.value = URL.createObjectURL(blob);
+            stopActiveAudioPlayback();
+
+            const player = audioPlayerRef.value || new Audio();
+            activeAudioPlayer = player;
+            player.src = transientAudioUrl.value;
+            player.muted = false;
+            player.volume = 1.0;
+            player.preload = "auto";
+            setAssistantMode("speaking", "语音播报中");
+
+            try {
+                await new Promise((resolve, reject) => {
+                    let settled = false;
+                    const cleanup = () => {
+                        window.clearTimeout(startTimeoutId);
+                        player.removeEventListener("playing", handlePlaying);
+                        player.removeEventListener("ended", handleEnded);
+                        player.removeEventListener("error", handleError);
+                    };
+                    const finish = (fn) => {
+                        if (settled) {
+                            return;
+                        }
+                        settled = true;
+                        cleanup();
+                        fn();
+                    };
+                    const handlePlaying = () => {
+                        window.clearTimeout(startTimeoutId);
+                    };
+                    const handleEnded = () => {
+                        finish(() => resolve(true));
+                    };
+                    const handleError = () => {
+                        finish(() => reject(new Error("audio_playback_failed")));
+                    };
+                    const startTimeoutId = window.setTimeout(() => {
+                        finish(() => reject(new Error("audio_playback_timeout")));
+                    }, 5000);
+
+                    player.addEventListener("playing", handlePlaying);
+                    player.addEventListener("ended", handleEnded);
+                    player.addEventListener("error", handleError);
+
+                    const playPromise = player.play();
+                    if (playPromise && typeof playPromise.then === "function") {
+                        playPromise.catch((err) => {
+                            finish(() => reject(err instanceof Error ? err : new Error("audio_playback_blocked")));
+                        });
+                    }
+                });
+                return true;
+            } catch (err) {
+                stopActiveAudioPlayback();
+                if (!soft) {
+                    assistant.lastHint = `语音播放失败：${err.message || "unknown"}`;
+                }
+                return false;
+            }
+        }
+
         async function unlockAudioPlayback() {
             if (assistant.audioUnlocked) {
                 return assistant.audioUnlocked;
@@ -841,50 +1081,43 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
             }
         }
 
-        function estimateSpeechDurationMs(text) {
-            const cleanText = String(text || "").trim();
-            const chineseChars = (cleanText.match(/[\u4e00-\u9fa5]/g) || []).length;
-            const otherChars = Math.max(cleanText.length - chineseChars, 0);
-            return Math.min(Math.max((chineseChars * 220) + (otherChars * 90) + 900, 2200), 16000);
-        }
-
-        async function speakWithLocalSpeaker(text, { soft = false } = {}) {
-            const cleanText = String(text || "").trim();
+        function splitSpeechSegments(text) {
+            const cleanText = String(text || "").replace(/\s+/g, " ").trim();
             if (!cleanText) {
-                return false;
+                return [];
             }
-            try {
-                const response = await fetch(XIAOAN_LOCAL_SPEAK_API, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                    },
-                    body: JSON.stringify({ text: cleanText }),
-                });
-                if (!response.ok) {
-                    let detail = `${response.status}`;
-                    try {
-                        const payload = await response.json();
-                        detail = payload.message || detail;
-                    } catch (error) {
-                        void error;
-                    }
-                    throw new Error(detail);
+
+            const sentenceParts = cleanText.match(/[^。！？!?；;]+[。！？!?；;]?/g) || [cleanText];
+            const segments = [];
+            for (const sentence of sentenceParts) {
+                const trimmedSentence = sentence.trim();
+                if (!trimmedSentence) {
+                    continue;
                 }
-                setAssistantMode("speaking", "语音播报中");
-                const requestSeq = assistant.ttsRequestSeq;
-                window.setTimeout(() => {
-                    if (requestSeq === assistant.ttsRequestSeq && !assistant.recording) {
-                        finishSpeaking();
-                    }
-                }, estimateSpeechDurationMs(cleanText));
-                return true;
-            } catch (err) {
-                if (!soft) {
-                    assistant.lastHint = `本机语音播报失败：${err.message || "unknown"}`;
+                if (trimmedSentence.length <= 34) {
+                    segments.push(trimmedSentence);
+                    continue;
                 }
-                return false;
+                const clauseParts = trimmedSentence.match(/[^，,、]+[，,、]?/g) || [trimmedSentence];
+                let buffer = "";
+                for (const clause of clauseParts) {
+                    const trimmedClause = clause.trim();
+                    if (!trimmedClause) {
+                        continue;
+                    }
+                    if (buffer && (buffer.length + trimmedClause.length) > 34) {
+                        segments.push(buffer);
+                        buffer = trimmedClause;
+                    } else {
+                        buffer += trimmedClause;
+                    }
+                }
+                if (buffer) {
+                    segments.push(buffer);
+                }
             }
+
+            return segments.length ? segments : [cleanText];
         }
 
         async function synthesizeAndPlay(text, { soft = false, audioUrl = "", preferBackend = false, forceRefresh = false } = {}) {
@@ -918,7 +1151,7 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
                 setAssistantMode("speaking", "正在合成语音");
                 const generatedBlob = await requestAudioBlob(cleanText, {
                     useCache: !forceRefresh,
-                    timeoutMs: 12000,
+                    timeoutMs: 45000,
                 });
                 if (requestSeq !== assistant.ttsRequestSeq) {
                     return false;
@@ -932,24 +1165,9 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
                     return false;
                 }
                 if (!soft) {
-                    assistant.lastHint = `MOSS 语音合成失败：${err.message || "unknown"}`;
+                    assistant.lastHint = `sherpa-onnx 语音合成失败：${err.message || "unknown"}`;
                 }
-            }
-
-            const browserPlayed = await speakWithBrowser(cleanText, { soft: true });
-            if (requestSeq !== assistant.ttsRequestSeq) {
                 return false;
-            }
-            if (browserPlayed) {
-                return true;
-            }
-
-            const localSpeakerStarted = await speakWithLocalSpeaker(cleanText, { soft: true });
-            if (requestSeq !== assistant.ttsRequestSeq) {
-                return false;
-            }
-            if (localSpeakerStarted) {
-                return true;
             }
 
             if (requestSeq !== assistant.ttsRequestSeq) {
@@ -957,11 +1175,57 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
             }
             if (!soft) {
                 assistant.lastHint = preferBackend
-                    ? "后端 MOSS 音频、浏览器语音和本机扬声器播报都失败了。"
+                    ? "sherpa-onnx 音频播放失败，请点击页面后重试。"
                     : "语音播报失败，请检查浏览器音量与输出设备。";
             }
             finishSpeaking();
             return false;
+        }
+
+        async function synthesizeAndPlaySegmented(text, { soft = false, forceRefresh = false } = {}) {
+            const cleanText = String(text || "").trim();
+            const segments = splitSpeechSegments(cleanText);
+            if (segments.length <= 1 || cleanText.length <= 34) {
+                return await synthesizeAndPlay(cleanText, { soft, preferBackend: true, forceRefresh });
+            }
+
+            const requestSeq = ++assistant.ttsRequestSeq;
+            setAssistantMode("speaking", "正在合成语音");
+            let nextAudioPromise = requestAudioBlob(segments[0], {
+                useCache: !forceRefresh,
+                timeoutMs: 15000,
+            });
+
+            try {
+                for (let index = 0; index < segments.length; index += 1) {
+                    const blob = await nextAudioPromise;
+                    if (requestSeq !== assistant.ttsRequestSeq) {
+                        return false;
+                    }
+                    nextAudioPromise = index + 1 < segments.length
+                        ? requestAudioBlob(segments[index + 1], {
+                            useCache: !forceRefresh,
+                            timeoutMs: 15000,
+                        })
+                        : null;
+
+                    const played = await playAudioBlobUntilEnded(blob, soft);
+                    if (!played || requestSeq !== assistant.ttsRequestSeq) {
+                        return false;
+                    }
+                }
+                finishSpeaking();
+                return true;
+            } catch (err) {
+                if (requestSeq !== assistant.ttsRequestSeq) {
+                    return false;
+                }
+                if (!soft) {
+                    assistant.lastHint = `语音合成失败：${err.message || "unknown"}`;
+                }
+                finishSpeaking();
+                return false;
+            }
         }
 
         async function playGreeting() {
@@ -1025,9 +1289,8 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
                                 const eventSpeechText = String(assistant.speechText || finalAnswer).trim();
                                 if (eventSpeechText) {
                                     setAssistantMode("speaking", "正在准备语音");
-                                    spokeForThisAnswer = await synthesizeAndPlay(eventSpeechText, {
+                                    spokeForThisAnswer = await synthesizeAndPlaySegmented(eventSpeechText, {
                                         soft: false,
-                                        preferBackend: true,
                                     });
                                 }
                                 assistant.busy = false;
@@ -1044,9 +1307,8 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
                 const speechText = String(finalEvent?.speech_text || assistant.speechText || finalAnswer || assistant.answer).trim();
                 if (!spokeForThisAnswer && speechText) {
                     setAssistantMode("speaking", "正在准备语音");
-                    await synthesizeAndPlay(speechText, {
+                    await synthesizeAndPlaySegmented(speechText, {
                         soft: false,
-                        preferBackend: true,
                     });
                 } else if (!spokeForThisAnswer) {
                     assistant.lastHint = "回答已显示，但没有可播报文本。";
@@ -1159,7 +1421,13 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
                 method: "POST",
                 body: formData,
             });
-            await handleVoiceTranscript(payload.transcript || "", { requireWake });
+            const transcript = String(payload.transcript || "").trim();
+            if (!transcript && assistant.browserAsrSupported) {
+                assistant.lastHint = "后端语音识别未识别到文字，请重新说一遍。";
+                await startBrowserRecognition({ followup: false, requireWake });
+                return;
+            }
+            await handleVoiceTranscript(transcript, { requireWake });
         }
 
         function stopBrowserRecognition() {
@@ -1307,6 +1575,39 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
             assistant.analyserFrameId = window.requestAnimationFrame(monitor);
         }
 
+        async function stopPcmRecordingSession() {
+            if (!assistant.pcmRecordingActive) {
+                return;
+            }
+            assistant.pcmRecordingActive = false;
+            const captureState = pcmCaptureState;
+            const chunks = captureState?.chunks || [];
+            const sampleRate = captureState?.sampleRate || 16000;
+            const requireWake = assistant.recordRequireWake;
+            let recordedBlob = null;
+            if (chunks.length > 0) {
+                recordedBlob = createWavBlobFromPcmChunks(chunks, sampleRate);
+            }
+            cleanupRecorder();
+            if (!recordedBlob || recordedBlob.size <= 44) {
+                assistant.followupArmed = false;
+                assistant.autoResumeAfterSpeak = false;
+                assistant.lastHint = "没有录到有效语音，请重试。";
+                setAssistantMode("idle", "等待唤醒");
+                return;
+            }
+            try {
+                await uploadRecordedAudio(recordedBlob, { requireWake });
+            } catch (err) {
+                assistant.answer = "语音识别失败，请稍后重试。";
+                assistant.error = err.message || "语音识别失败";
+                assistant.lastHint = assistant.error;
+                assistant.followupArmed = false;
+                assistant.autoResumeAfterSpeak = false;
+                setAssistantMode("idle", "等待唤醒");
+            }
+        }
+
         async function startRecordingSession({ followup = false, requireWake = true } = {}) {
             if (assistant.busy || assistant.recording) {
                 return;
@@ -1316,58 +1617,83 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
             assistant.voiceDetected = false;
             assistant.recordStartedAt = performance.now();
             assistant.lastVoiceAt = assistant.recordStartedAt;
-
-            const mimeType = pickSupportedMimeType();
-            assistant.recorder = mimeType
-                ? new MediaRecorder(assistant.mediaStream, { mimeType })
-                : new MediaRecorder(assistant.mediaStream);
-            assistant.recorder.ondataavailable = (event) => {
-                if (event.data && event.data.size > 0) {
-                    assistant.recordChunks.push(event.data);
-                }
-            };
-            assistant.recorder.onerror = () => {
-                assistant.lastHint = "录音失败，请检查麦克风权限。";
-                assistant.followupArmed = false;
-                assistant.autoResumeAfterSpeak = false;
-                cleanupRecorder();
-                setAssistantMode("idle", "等待唤醒");
-            };
-            assistant.recorder.onstop = async () => {
-                const blobType = assistant.recordChunks[0]?.type || mimeType || "audio/webm";
-                const recordedBlob = new Blob(assistant.recordChunks, { type: blobType });
-                cleanupRecorder();
-                if (recordedBlob.size <= 0) {
-                    assistant.followupArmed = false;
-                    assistant.autoResumeAfterSpeak = false;
-                    assistant.lastHint = "没有录到有效语音，请重试。";
-                    setAssistantMode("idle", "等待唤醒");
-                    return;
-                }
-                try {
-                    await uploadRecordedAudio(recordedBlob, { requireWake });
-                } catch (err) {
-                    assistant.answer = "语音识别失败，请稍后重试。";
-                    assistant.error = err.message || "语音识别失败";
-                    assistant.lastHint = assistant.error;
-                    assistant.followupArmed = false;
-                    assistant.autoResumeAfterSpeak = false;
-                    setAssistantMode("idle", "等待唤醒");
-                }
-            };
+            assistant.recordRequireWake = requireWake;
 
             const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
             if (AudioContextCtor) {
                 assistant.audioContext = new AudioContextCtor();
+                if (assistant.audioContext.state === "suspended") {
+                    await assistant.audioContext.resume().catch(() => {});
+                }
                 assistant.analyser = assistant.audioContext.createAnalyser();
                 assistant.analyser.fftSize = 2048;
                 assistant.analyserSource = assistant.audioContext.createMediaStreamSource(assistant.mediaStream);
                 assistant.analyserSource.connect(assistant.analyser);
+                const processor = assistant.audioContext.createScriptProcessor(4096, 1, 1);
+                const silenceGain = assistant.audioContext.createGain();
+                silenceGain.gain.value = 0;
+                pcmCaptureState = {
+                    chunks: [],
+                    sampleRate: assistant.audioContext.sampleRate || 16000,
+                    processor,
+                    silenceGain,
+                };
+                processor.onaudioprocess = (event) => {
+                    if (!assistant.pcmRecordingActive || !pcmCaptureState) {
+                        return;
+                    }
+                    const channel = event.inputBuffer.getChannelData(0);
+                    pcmCaptureState.chunks.push(new Float32Array(channel));
+                };
+                assistant.analyserSource.connect(processor);
+                processor.connect(silenceGain);
+                silenceGain.connect(assistant.audioContext.destination);
+                assistant.pcmRecordingActive = true;
+                assistant.recording = true;
                 startSilenceMonitor();
+            } else {
+                const mimeType = pickSupportedMimeType();
+                assistant.recorder = mimeType
+                    ? new MediaRecorder(assistant.mediaStream, { mimeType })
+                    : new MediaRecorder(assistant.mediaStream);
+                assistant.recorder.ondataavailable = (event) => {
+                    if (event.data && event.data.size > 0) {
+                        assistant.recordChunks.push(event.data);
+                    }
+                };
+                assistant.recorder.onerror = () => {
+                    assistant.lastHint = "录音失败，请检查麦克风权限。";
+                    assistant.followupArmed = false;
+                    assistant.autoResumeAfterSpeak = false;
+                    cleanupRecorder();
+                    setAssistantMode("idle", "等待唤醒");
+                };
+                assistant.recorder.onstop = async () => {
+                    const blobType = assistant.recordChunks[0]?.type || mimeType || "audio/webm";
+                    const recordedBlob = new Blob(assistant.recordChunks, { type: blobType });
+                    cleanupRecorder();
+                    if (recordedBlob.size <= 0) {
+                        assistant.followupArmed = false;
+                        assistant.autoResumeAfterSpeak = false;
+                        assistant.lastHint = "没有录到有效语音，请重试。";
+                        setAssistantMode("idle", "等待唤醒");
+                        return;
+                    }
+                    try {
+                        await uploadRecordedAudio(recordedBlob, { requireWake });
+                    } catch (err) {
+                        assistant.answer = "语音识别失败，请稍后重试。";
+                        assistant.error = err.message || "语音识别失败";
+                        assistant.lastHint = assistant.error;
+                        assistant.followupArmed = false;
+                        assistant.autoResumeAfterSpeak = false;
+                        setAssistantMode("idle", "等待唤醒");
+                    }
+                };
+                assistant.recorder.start();
+                assistant.recording = true;
             }
 
-            assistant.recorder.start();
-            assistant.recording = true;
             const directAsk = !requireWake || followup;
             assistant.lastHint = directAsk
                 ? "请直接说出你的问题。"
@@ -1376,6 +1702,10 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
         }
 
         async function startVoiceCapture({ followup = false, requireWake = true } = {}) {
+            if (assistant.preferBrowserAsr && assistant.browserAsrSupported) {
+                await startBrowserRecognition({ followup, requireWake });
+                return;
+            }
             try {
                 await startRecordingSession({ followup, requireWake });
                 return;
@@ -1482,7 +1812,6 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
             dashboard,
             donutStyle,
             error,
-            FALLBACK_LOGO,
             formatReferenceTime,
             hourlyTrendSvg,
             isHighLog,
@@ -1499,6 +1828,10 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
             submitInput,
             summaryCard,
             toggleRecording,
+            onlineCameraRate,
+            overviewDelta,
+            weeklyHighBarsSvg,
+            weeklyHighMax,
             weeklyMax,
             weeklyTrend,
             markCameraError,
@@ -1538,56 +1871,83 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
 
             <main class="grid-shell">
                 <section class="column">
-                    <article class="panel">
-                        <div class="panel-head">
+                    <article class="panel panel--overall">
+                        <h2 class="panel-title panel-title--zh">总体态势</h2>
+                        <div class="overview-metrics">
+                            <div class="overview-tile overview-tile--blue">
+                                <div class="overview-icon" aria-hidden="true">
+                                    <svg viewBox="0 0 24 24">
+                                        <rect x="4" y="5" width="16" height="15" rx="3"></rect>
+                                        <path d="M8 3v4M16 3v4M4 10h16M8 14h2M12 14h2M16 14h1"></path>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <div class="overview-label">今日事件</div>
+                                    <div class="overview-value">{{ dashboard.overview.today_event_count }}</div>
+                                    <div class="overview-delta">较昨日 <span :class="overviewDelta('today_event').className">{{ overviewDelta('today_event').text }}</span></div>
+                                </div>
+                            </div>
+                            <div class="overview-tile overview-tile--red">
+                                <div class="overview-icon" aria-hidden="true">
+                                    <svg viewBox="0 0 24 24">
+                                        <path d="M12 3l9 17H3L12 3z"></path>
+                                        <path d="M12 8v5M12 17h.01"></path>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <div class="overview-label">高危事件</div>
+                                    <div class="overview-value">{{ dashboard.overview.high_risk_count }}</div>
+                                    <div class="overview-delta overview-delta--red">较昨日 <span :class="overviewDelta('high_risk').className">{{ overviewDelta('high_risk').text }}</span></div>
+                                </div>
+                            </div>
+                            <div class="overview-tile overview-tile--amber">
+                                <div class="overview-icon" aria-hidden="true">
+                                    <svg viewBox="0 0 24 24">
+                                        <path d="M12 3l7 3v5c0 5-3.3 8.3-7 10c-3.7-1.7-7-5-7-10V6l7-3z"></path>
+                                        <path d="M12 8v7M8.5 11.5h7"></path>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <div class="overview-label">中危事件</div>
+                                    <div class="overview-value">{{ dashboard.overview.medium_risk_count }}</div>
+                                    <div class="overview-delta overview-delta--amber">较昨日 <span :class="overviewDelta('medium_risk').className">{{ overviewDelta('medium_risk').text }}</span></div>
+                                </div>
+                            </div>
+                            <div class="overview-tile overview-tile--cyan">
+                                <div class="overview-icon" aria-hidden="true">
+                                    <svg viewBox="0 0 24 24">
+                                        <path d="M21 4L10 15"></path>
+                                        <path d="M21 4l-7 17l-4-6l-7-3l18-8z"></path>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <div class="overview-label">预警发送</div>
+                                    <div class="overview-value">{{ dashboard.overview.alerts_sent_count }}</div>
+                                    <div class="overview-delta overview-delta--green">较昨日 <span :class="overviewDelta('alerts_sent').className">{{ overviewDelta('alerts_sent').text }}</span></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="overview-camera">
+                            <div class="overview-icon overview-icon--camera" aria-hidden="true">
+                                <svg viewBox="0 0 24 24">
+                                    <rect x="4" y="7" width="11" height="10" rx="2"></rect>
+                                    <path d="M15 10l5-3v10l-5-3zM9.5 10.5a2 2 0 1 1 0 4a2 2 0 0 1 0-4z"></path>
+                                </svg>
+                            </div>
                             <div>
-                                <h2 class="panel-title">Overall Situation</h2>
-                                <p class="panel-subtitle">总体态势</p>
-                            </div>
-                        </div>
-                        <div class="stats-grid">
-                            <div class="stat-card">
-                                <div class="stat-card__label">Today Events</div>
-                                <div class="stat-card__value">{{ dashboard.overview.today_event_count }}</div>
-                            </div>
-                            <div class="stat-card stat-card--danger">
-                                <div class="stat-card__label">High Risk</div>
-                                <div class="stat-card__value">{{ dashboard.overview.high_risk_count }}</div>
-                            </div>
-                            <div class="stat-card stat-card--warn">
-                                <div class="stat-card__label">Med Risk</div>
-                                <div class="stat-card__value">{{ dashboard.overview.medium_risk_count }}</div>
-                            </div>
-                            <div class="stat-card stat-card--cyan">
-                                <div class="stat-card__label">Alerts Sent</div>
-                                <div class="stat-card__value">{{ dashboard.overview.alerts_sent_count }}</div>
-                            </div>
-                        </div>
-                        <div class="mini-grid">
-                            <div class="mini-status">
-                                <div class="mini-status__label">Cam Status</div>
-                                <div class="mini-status__value">{{ dashboard.overview.online_cameras }}/{{ dashboard.overview.total_cameras }}</div>
-                                <div class="mini-status__sub">在线摄像头</div>
-                            </div>
-                            <div class="mini-status">
-                                <div class="mini-status__label">Last Task</div>
-                                <div class="mini-status__value" :class="{ 'text-danger': dashboard.overview.task_status === 'failed' }">{{ dashboard.overview.task_label }}</div>
-                                <div class="mini-status__sub">{{ dashboard.overview.last_task_id || '暂无任务' }}</div>
+                                <div class="overview-label">在线摄像头</div>
+                                <div class="overview-camera__row">
+                                    <span>{{ dashboard.overview.online_cameras }} / {{ dashboard.overview.total_cameras }}</span>
+                                    <small>在线率 <b>{{ onlineCameraRate }}%</b></small>
+                                </div>
                             </div>
                         </div>
                     </article>
 
-                    <article class="panel">
-                        <div class="panel-head">
-                            <div>
-                                <h2 class="panel-title">Trend Analysis</h2>
-                                <p class="panel-subtitle">趋势分析</p>
-                            </div>
-                        </div>
-
+                    <article class="panel panel--trend-line">
+                        <h2 class="panel-title panel-title--zh">24小时事件趋势</h2>
                         <div class="chart-block">
-                            <h3 class="chart-title">24H Event Trend (24小时趋势)</h3>
-                            <div class="line-chart">
+                            <div class="line-chart line-chart--axis">
                                 <svg viewBox="0 0 480 140" width="100%" height="100%" preserveAspectRatio="none">
                                     <defs>
                                         <linearGradient id="trendArea" x1="0" x2="0" y1="0" y2="1">
@@ -1595,51 +1955,125 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
                                             <stop offset="100%" stop-color="rgba(35,225,255,0.02)" />
                                         </linearGradient>
                                     </defs>
+                                    <line x1="42" x2="42" y1="18" y2="116" stroke="rgba(125,149,184,0.32)" />
+                                    <line x1="42" x2="466" y1="116" y2="116" stroke="rgba(125,149,184,0.24)" />
                                     <line
                                         v-for="grid in hourlyTrendSvg.gridLines"
                                         :key="grid.y"
-                                        x1="14"
+                                        x1="42"
                                         x2="466"
                                         :y1="grid.y"
                                         :y2="grid.y"
                                         stroke="rgba(125,149,184,0.18)"
                                         stroke-dasharray="4 6"
                                     />
+                                    <text
+                                        v-for="grid in hourlyTrendSvg.gridLines"
+                                        :key="'axis-' + grid.label"
+                                        x="30"
+                                        :y="Number(grid.y) + 4"
+                                        text-anchor="end"
+                                        fill="rgba(193,217,247,0.78)"
+                                        font-size="11"
+                                    >{{ grid.label }}</text>
                                     <path :d="hourlyTrendSvg.areaPath" fill="url(#trendArea)"></path>
                                     <path :d="hourlyTrendSvg.linePath" stroke="#23e1ff" stroke-width="3" fill="none" stroke-linecap="round"></path>
+                                    <text
+                                        v-for="tick in hourlyTrendSvg.xAxisTicks"
+                                        :key="'x-' + tick.label"
+                                        :x="tick.x"
+                                        y="136"
+                                        text-anchor="middle"
+                                        fill="rgba(193,217,247,0.72)"
+                                        font-size="10"
+                                    >{{ tick.label }}</text>
                                 </svg>
                             </div>
                         </div>
 
-                        <div class="chart-block">
-                            <h3 class="chart-title">7-Day Risk Distribution (7天事件分布)</h3>
-                            <div class="weekly-bars">
-                                <div v-for="item in weeklyTrend" :key="item.date" class="weekly-bar">
-                                    <div class="weekly-bar__value">{{ item.total }}</div>
-                                    <div class="weekly-bar__track">
-                                        <div
-                                            class="weekly-bar__fill"
-                                            :style="{ height: Math.max(6, item.total / weeklyMax * 100) + '%' }"
-                                        ></div>
-                                    </div>
-                                    <div class="weekly-bar__label">{{ item.label }}</div>
-                                </div>
+                    </article>
+
+                    <article class="panel panel--risk-distribution">
+                        <div class="chart-title-row">
+                            <h2 class="panel-title panel-title--zh">7天事件分布</h2>
+                            <div class="chart-legend">
+                                <span><i class="legend-dot legend-dot--low"></i>低危/正常事件</span>
+                                <span><i class="legend-dot legend-dot--high"></i>高危事件</span>
                             </div>
                         </div>
-
                         <div class="chart-block">
-                            <h3 class="chart-title">Risk Time Heatmap (时段热力图)</h3>
-                            <div class="heatmap-grid">
-                                <div v-for="item in dashboard.trends.heatmap" :key="item.key" class="heat-cell">
-                                    <div class="heat-cell__label">{{ item.label }}</div>
-                                    <div class="heat-cell__value">{{ item.value }}</div>
-                                    <div class="heat-cell__bar">
-                                        <div
-                                            class="heat-cell__fill"
-                                            :style="{ width: Math.max(8, item.intensity * 100) + '%', background: item.color }"
-                                        ></div>
-                                    </div>
-                                </div>
+                            <div class="weekly-risk-chart">
+                                <svg viewBox="0 0 320 170" width="100%" height="100%" preserveAspectRatio="none">
+                                    <defs>
+                                        <linearGradient id="weeklyLowBar" x1="0" x2="0" y1="0" y2="1">
+                                            <stop offset="0%" stop-color="#28e8ff" />
+                                            <stop offset="100%" stop-color="#126dff" />
+                                        </linearGradient>
+                                        <linearGradient id="weeklyRiskBar" x1="0" x2="0" y1="0" y2="1">
+                                            <stop offset="0%" stop-color="#ff4b57" />
+                                            <stop offset="100%" stop-color="#a90d22" />
+                                        </linearGradient>
+                                    </defs>
+                                    <line x1="36" x2="36" y1="24" y2="142" stroke="rgba(125,149,184,0.26)" />
+                                    <line x1="36" x2="306" y1="142" y2="142" stroke="rgba(125,149,184,0.24)" />
+                                    <g v-for="grid in weeklyHighBarsSvg.gridLines" :key="'weekly-grid-' + grid.label">
+                                        <line
+                                            x1="36"
+                                            x2="306"
+                                            :y1="grid.y"
+                                            :y2="grid.y"
+                                            stroke="rgba(125,149,184,0.16)"
+                                        />
+                                        <text
+                                            x="26"
+                                            :y="Number(grid.y) + 4"
+                                            text-anchor="end"
+                                            fill="rgba(193,217,247,0.72)"
+                                            font-size="10"
+                                        >{{ grid.label }}</text>
+                                    </g>
+                                    <g v-for="group in weeklyHighBarsSvg.bars" :key="group.date">
+                                        <text
+                                            :x="group.low.centerX"
+                                            :y="Math.max(14, Number(group.low.y) - 5)"
+                                            text-anchor="middle"
+                                            fill="#9ff7ff"
+                                            font-size="9"
+                                            font-weight="700"
+                                        >{{ group.low.value }}</text>
+                                        <rect
+                                            :x="group.low.x"
+                                            :y="group.low.y"
+                                            :width="group.low.width"
+                                            :height="group.low.height"
+                                            rx="3"
+                                            fill="url(#weeklyLowBar)"
+                                        />
+                                        <text
+                                            :x="group.high.centerX"
+                                            :y="Math.max(14, Number(group.high.y) - 5)"
+                                            text-anchor="middle"
+                                            fill="#ffc8cf"
+                                            font-size="9"
+                                            font-weight="700"
+                                        >{{ group.high.value }}</text>
+                                        <rect
+                                            :x="group.high.x"
+                                            :y="group.high.y"
+                                            :width="group.high.width"
+                                            :height="group.high.height"
+                                            rx="3"
+                                            fill="url(#weeklyRiskBar)"
+                                        />
+                                        <text
+                                            :x="group.labelX"
+                                            y="160"
+                                            text-anchor="middle"
+                                            fill="rgba(193,217,247,0.72)"
+                                            font-size="10"
+                                        >{{ group.label }}</text>
+                                    </g>
+                                </svg>
                             </div>
                         </div>
                     </article>
@@ -1662,17 +2096,10 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
                                 </div>
                             </div>
                             <div class="camera-frame__top">
-                                <div class="camera-top-badges">
-                                    <span class="badge badge--danger">REC</span>
-                                    <span class="badge badge--cyan">{{ primaryCamera?.name || 'CAM_01' }}</span>
-                                </div>
                                 <span class="badge badge--status">{{ primaryCamera?.available ? '在线' : '离线' }}</span>
                             </div>
                             <div class="camera-frame__bottom">
-                                <div class="feed-meta">
-                                    <span>MODE: {{ dashboard.capture_mode === 'remote_manifest' ? 'REMOTE' : 'LOCAL' }}</span>
-                                    <span>TASK: {{ dashboard.task.status || 'idle' }}</span>
-                                </div>
+                                <span class="badge badge--cyan">{{ primaryCamera?.name || '1号摄像头' }}</span>
                             </div>
                         </article>
 
@@ -1691,17 +2118,10 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
                                 </div>
                             </div>
                             <div class="camera-frame__top">
-                                <div class="camera-top-badges">
-                                    <span class="badge">LIVE</span>
-                                    <span class="badge badge--cyan">{{ secondaryCamera?.name || 'CAM_02' }}</span>
-                                </div>
                                 <span class="badge badge--status">{{ secondaryCamera?.available ? '在线' : '离线' }}</span>
                             </div>
                             <div class="camera-frame__bottom">
-                                <div class="feed-meta">
-                                    <span>CAMERA: {{ secondaryCamera?.camera_id || 'cam02' }}</span>
-                                    <span>PREVIEW</span>
-                                </div>
+                                <span class="badge badge--cyan">{{ secondaryCamera?.name || '2号摄像头' }}</span>
                             </div>
                         </article>
                     </div>
@@ -1710,8 +2130,96 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
                 <section class="column">
                     <article class="panel assistant-card">
                         <div class="assistant-header">
-                            <div class="assistant-avatar">
-                                <img :src="FALLBACK_LOGO" alt="小安 logo">
+                            <div
+                                class="xiaoan-pet"
+                                :class="assistant.mode === 'speaking' ? 'xiaoan-pet--speaking' : 'xiaoan-pet--idle'"
+                                aria-label="智能助理小安桌宠"
+                            >
+                                <svg viewBox="0 0 240 220" role="img" aria-hidden="true">
+                                    <defs>
+                                        <radialGradient id="petBodyGlow" cx="50%" cy="22%" r="82%">
+                                            <stop offset="0%" stop-color="#a9fbff"/>
+                                            <stop offset="42%" stop-color="#12cfff"/>
+                                            <stop offset="100%" stop-color="#0067df"/>
+                                        </radialGradient>
+                                        <linearGradient id="petHeadShell" x1="42" x2="198" y1="56" y2="126">
+                                            <stop offset="0%" stop-color="#ffffff"/>
+                                            <stop offset="42%" stop-color="#d8f7ff"/>
+                                            <stop offset="72%" stop-color="#73dfff"/>
+                                            <stop offset="100%" stop-color="#0078ff"/>
+                                        </linearGradient>
+                                        <linearGradient id="petVisor" x1="58" x2="182" y1="83" y2="130">
+                                            <stop offset="0%" stop-color="#112f63"/>
+                                            <stop offset="48%" stop-color="#061a3f"/>
+                                            <stop offset="100%" stop-color="#020c21"/>
+                                        </linearGradient>
+                                        <linearGradient id="petEarGlow" x1="0" x2="1">
+                                            <stop offset="0%" stop-color="#043b9d"/>
+                                            <stop offset="45%" stop-color="#19ddff"/>
+                                            <stop offset="100%" stop-color="#0648d6"/>
+                                        </linearGradient>
+                                        <radialGradient id="petGroundGlow" cx="50%" cy="50%" r="50%">
+                                            <stop offset="0%" stop-color="#23e1ff" stop-opacity="0.62"/>
+                                            <stop offset="72%" stop-color="#0968ff" stop-opacity="0.18"/>
+                                            <stop offset="100%" stop-color="#23e1ff" stop-opacity="0"/>
+                                        </radialGradient>
+                                        <filter id="petCyanGlow" x="-50%" y="-50%" width="200%" height="200%">
+                                            <feGaussianBlur stdDeviation="4" result="blur"/>
+                                            <feMerge>
+                                                <feMergeNode in="blur"/>
+                                                <feMergeNode in="SourceGraphic"/>
+                                            </feMerge>
+                                        </filter>
+                                    </defs>
+                                    <ellipse class="pet-ground" cx="120" cy="197" rx="75" ry="15" fill="url(#petGroundGlow)"/>
+                                    <g class="pet-halo pet-halo--back" filter="url(#petCyanGlow)">
+                                        <circle cx="120" cy="111" r="82" fill="none" stroke="rgba(35,225,255,0.16)" stroke-width="1.6"/>
+                                        <path d="M35 103A86 86 0 0 1 108 27" fill="none" stroke="#23e1ff" stroke-width="5" stroke-linecap="round" stroke-dasharray="2 7"/>
+                                        <path d="M138 28A86 86 0 0 1 203 85" fill="none" stroke="#23e1ff" stroke-width="7" stroke-linecap="round"/>
+                                        <path d="M196 145A86 86 0 0 1 119 197" fill="none" stroke="#0574ff" stroke-width="5" stroke-linecap="round" stroke-dasharray="8 8"/>
+                                        <circle class="pet-orbit-dot" cx="181" cy="49" r="4" fill="#23e1ff"/>
+                                        <circle class="pet-orbit-dot pet-orbit-dot--small" cx="196" cy="123" r="3" fill="#23e1ff"/>
+                                    </g>
+                                    <g class="pet-wave pet-wave--left">
+                                        <rect x="9" y="100" width="5" height="16" rx="3"/>
+                                        <rect x="20" y="92" width="6" height="34" rx="3"/>
+                                        <rect x="33" y="86" width="6" height="46" rx="3"/>
+                                        <rect x="46" y="96" width="5" height="26" rx="3"/>
+                                        <circle cx="58" cy="109" r="3"/>
+                                    </g>
+                                    <g class="pet-wave pet-wave--right">
+                                        <circle cx="182" cy="109" r="3"/>
+                                        <rect x="190" y="96" width="5" height="26" rx="3"/>
+                                        <rect x="202" y="86" width="6" height="46" rx="3"/>
+                                        <rect x="215" y="92" width="6" height="34" rx="3"/>
+                                        <rect x="227" y="100" width="5" height="16" rx="3"/>
+                                    </g>
+                                    <g class="pet-body">
+                                        <path d="M120 137C96 137 78 159 78 184C78 204 95 212 120 212C145 212 162 204 162 184C162 159 144 137 120 137Z" fill="url(#petBodyGlow)" stroke="rgba(151,248,255,0.78)" stroke-width="3"/>
+                                        <path d="M120 161L139 170V188L120 198L101 188V170L120 161Z" fill="rgba(8,41,93,0.62)" stroke="#9affff" stroke-width="4" stroke-linejoin="round"/>
+                                        <path d="M120 170L130 175V185L120 190L110 185V175L120 170Z" fill="#38e7ff" opacity="0.88"/>
+                                        <ellipse cx="103" cy="158" rx="8" ry="17" fill="rgba(255,255,255,0.36)" transform="rotate(30 103 158)"/>
+                                    </g>
+                                    <g class="pet-head">
+                                        <path class="pet-antenna" d="M120 56V28" stroke="#c8fbff" stroke-width="4" stroke-linecap="round"/>
+                                        <circle cx="120" cy="24" r="10" fill="url(#petBodyGlow)" stroke="#b6fbff" stroke-width="3"/>
+                                        <rect x="92" y="44" width="56" height="28" rx="12" fill="rgba(240,250,255,0.28)" stroke="rgba(39,106,185,0.55)" stroke-width="2"/>
+                                        <ellipse cx="57" cy="105" rx="18" ry="34" fill="url(#petEarGlow)" stroke="#66efff" stroke-width="3"/>
+                                        <ellipse cx="183" cy="105" rx="18" ry="34" fill="url(#petEarGlow)" stroke="#66efff" stroke-width="3"/>
+                                        <ellipse cx="60" cy="105" rx="9" ry="27" fill="rgba(214,252,255,0.36)"/>
+                                        <ellipse cx="180" cy="105" rx="9" ry="27" fill="rgba(214,252,255,0.36)"/>
+                                        <path d="M120 52C158 52 189 70 194 100C199 129 172 151 139 153H101C68 151 41 129 46 100C51 70 82 52 120 52Z" fill="url(#petHeadShell)" stroke="rgba(198,249,255,0.88)" stroke-width="3"/>
+                                        <rect x="63" y="83" width="114" height="57" rx="27" fill="url(#petVisor)" stroke="rgba(94,223,255,0.62)" stroke-width="4"/>
+                                        <path d="M69 72C83 57 103 51 122 52" fill="none" stroke="rgba(255,255,255,0.72)" stroke-width="4" stroke-linecap="round"/>
+                                        <path class="pet-eye-idle pet-eye-idle--left" d="M84 109q10-18 22 0" fill="none" stroke="#23e1ff" stroke-width="9" stroke-linecap="round"/>
+                                        <path class="pet-eye-idle pet-eye-idle--right" d="M133 109q10-18 22 0" fill="none" stroke="#23e1ff" stroke-width="9" stroke-linecap="round"/>
+                                        <circle class="pet-eye-speaking pet-eye-speaking--left" cx="96" cy="106" r="11" fill="#65f7ff"/>
+                                        <circle class="pet-eye-speaking pet-eye-speaking--right" cx="144" cy="106" r="11" fill="#23e1ff"/>
+                                        <path class="pet-mouth-idle" d="M107 125q13 10 26 0" fill="none" stroke="#0b65d7" stroke-width="3" stroke-linecap="round"/>
+                                        <path class="pet-mouth-speaking" d="M102 124q18 28 36 0Z" fill="#30f4ff"/>
+                                    </g>
+                                    <circle class="pet-online-dot" cx="151" cy="143" r="8"/>
+                                </svg>
                             </div>
                             <div>
                                 <h2 class="assistant-title">智能助理 · 小安</h2>
@@ -1786,11 +2294,10 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
                         </div>
                     </article>
 
-                    <article class="panel">
+                    <article class="panel structure-panel">
                         <div class="panel-head">
                             <div>
-                                <h2 class="panel-title">Structure</h2>
-                                <p class="panel-subtitle">风险结构分析</p>
+                                <h2 class="panel-title structure-title">风险结构分析</h2>
                             </div>
                         </div>
 
@@ -1827,31 +2334,6 @@ async function playAudio(url, soft = false, { cacheBust = true } = {}) {
                         </div>
                     </article>
 
-                    <article class="panel">
-                        <div class="panel-head">
-                            <div>
-                                <h2 class="panel-title">Intel Logs</h2>
-                                <p class="panel-subtitle">实时日志与日报摘要</p>
-                            </div>
-                        </div>
-
-                        <div class="log-list">
-                            <div
-                                v-for="log in latestLogs"
-                                :key="log.time + log.category + log.message"
-                                class="log-item"
-                                :class="{ 'log-item--high': isHighLog(log) }"
-                            >
-                                <div class="log-item__title">[{{ log.category }}] {{ log.time }}</div>
-                                <div class="log-item__desc">{{ log.message }}</div>
-                            </div>
-                        </div>
-
-                        <div class="summary-card">
-                            <h3 class="summary-card__title">{{ summaryCard.title }}</h3>
-                            <div class="summary-card__text">{{ summaryCard.overall_summary }}</div>
-                        </div>
-                    </article>
                 </section>
             </main>
 
